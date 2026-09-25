@@ -1,6 +1,7 @@
 """Tests for the ``python -m app.backup`` online-backup command."""
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 import subprocess
@@ -22,14 +23,11 @@ def ledger_db(tmp_path, monkeypatch):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     db_path = data_dir / "ledger.db"
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode = WAL")
-    for version in sorted(app_db.MIGRATIONS):
-        conn.executescript(app_db.MIGRATIONS[version])
-        # Same constant-internal literal as app.db._migrate.
-        conn.execute(f"PRAGMA user_version = {version}")
-    conn.commit()
-    conn.close()
+    # Build the schema through the real migrator: V7's column additions and
+    # backfill are applied by app.db._migrate itself, not by the MIGRATIONS
+    # scripts alone.
+    monkeypatch.setattr(app_db, "settings", Settings(db_path=str(db_path)))
+    asyncio.run(app_db.init_db())
     monkeypatch.setattr(backup, "settings", Settings(db_path=str(db_path)))
     return db_path
 

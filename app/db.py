@@ -14,9 +14,16 @@ Concurrency model
 Schema migrations
 -----------------
 A ``PRAGMA user_version`` integer selects the next migration to apply.
-Each migration is an idempotent DDL script wrapped in one transaction, so
-both fresh databases and old ledgers created before reservations existed
-arrive at the latest schema on startup.
+Each version's schema changes, data backfill and the ``user_version`` bump
+itself commit in **one** transaction (``PRAGMA user_version`` is
+transactional in SQLite), so an interrupted upgrade rolls back completely
+and the next start simply retries the version.  Version 7 additionally
+applies its column additions conditionally, so a database left
+half-migrated by the pre-atomic migrator (V7 artefacts committed,
+``user_version`` still 6) is detected and completed on startup instead of
+failing on ``duplicate column name``.  Both fresh databases and old
+ledgers created before reservations existed therefore arrive at the
+latest schema on startup.
 """
 from __future__ import annotations
 
@@ -238,14 +245,12 @@ CREATE INDEX IF NOT EXISTS idx_renewals_dataset
 # the adjusted quota.  Rejected attempts (projected epsilon over the cap) are
 # stored too, with *_after == *_before: the live quota is demonstrably
 # untouched while the first verdict and its quota snapshots survive.
+#
+# The two ``ALTER TABLE`` statements and the original-quota backfill are not
+# part of this script: ``_migrate_v7`` issues them conditionally, because a
+# database interrupted by the pre-atomic migrator may already carry them
+# (see ``_migrate``).
 SCHEMA_V7 = """
-ALTER TABLE reservations ADD COLUMN original_epsilon REAL;
-ALTER TABLE reservations ADD COLUMN original_delta REAL;
-UPDATE reservations
-   SET original_epsilon = epsilon,
-       original_delta = delta
- WHERE original_epsilon IS NULL;
-
 CREATE TABLE IF NOT EXISTS reservation_adjustments (
     id                        INTEGER PRIMARY KEY AUTOINCREMENT,
     dataset_id                TEXT NOT NULL,
@@ -391,12 +396,76 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     version = int(row[0])
     while version < LATEST_VERSION:
         next_version = version + 1
-        await db.executescript(MIGRATIONS[next_version])
-        # PRAGMA user_version accepts only an integer literal, and next_version
-        # is an internal constant, never user input.
-        await db.execute(f"PRAGMA user_version = {next_version}")
+        # One transaction per version: schema changes, data backfill and the
+        # user_version bump commit or roll back together (PRAGMA user_version
+        # is itself transactional in SQLite).  A crash mid-migration can
+        # therefore never leave a half-applied version behind; the next start
+        # simply retries the same version.
+        await begin_immediate(db)
+        try:
+            await _apply_migration(db, next_version)
+            # PRAGMA user_version accepts only an integer literal, and
+            # next_version is an internal constant, never user input.
+            await db.execute(f"PRAGMA user_version = {next_version}")
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
         version = next_version
-    await db.commit()
+
+
+async def _apply_migration(db: aiosqlite.Connection, version: int) -> None:
+    if version == 7:
+        await _migrate_v7(db)
+    await _execute_script(db, MIGRATIONS[version])
+
+
+async def _execute_script(db: aiosqlite.Connection, script: str) -> None:
+    """Run a migration script statement by statement.
+
+    ``executescript`` issues an implicit COMMIT first, which would break the
+    surrounding per-version transaction; the bundled scripts contain no
+    semicolons inside a statement, so splitting on ``;`` is exact.
+    """
+    for statement in script.split(";"):
+        statement = statement.strip()
+        if statement:
+            await db.execute(statement)
+
+
+async def _table_columns(db: aiosqlite.Connection, table: str) -> set[str]:
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        rows = await cur.fetchall()
+    return {str(row[1]) for row in rows}
+
+
+async def _migrate_v7(db: aiosqlite.Connection) -> None:
+    """Add the original-quota columns and backfill them, idempotently.
+
+    The pre-atomic migrator committed the V7 DDL script and the
+    ``user_version`` bump separately, so a process kill in between could
+    leave a database with some V7 artefacts already committed while
+    ``user_version`` stayed at 6; the next start then re-ran the ALTERs and
+    died on ``duplicate column name``.  Every step here is therefore
+    conditional: a pristine v6 database and such a half-migrated one
+    converge to the same final state inside the caller's transaction.
+    """
+    columns = await _table_columns(db, "reservations")
+    if "original_epsilon" not in columns:
+        await db.execute(
+            "ALTER TABLE reservations ADD COLUMN original_epsilon REAL"
+        )
+    if "original_delta" not in columns:
+        await db.execute(
+            "ALTER TABLE reservations ADD COLUMN original_delta REAL"
+        )
+    # Backfill only rows never stamped before: original quotas already
+    # recorded (the creation payload of reservations adjusted since) are
+    # preserved, as are the live epsilon/delta of every reservation.
+    await db.execute(
+        "UPDATE reservations SET original_epsilon = epsilon, "
+        "original_delta = delta WHERE original_epsilon IS NULL"
+    )
 
 
 @asynccontextmanager
