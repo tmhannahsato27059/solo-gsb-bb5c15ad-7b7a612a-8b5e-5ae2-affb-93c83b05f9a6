@@ -934,3 +934,189 @@ async def test_migration_from_v6_schema(tmp_path, monkeypatch):
         assert row["epsilon"] == pytest.approx(0.1)
         assert row["original_epsilon"] == pytest.approx(0.1)
         assert row["original_delta"] == pytest.approx(1e-7)
+
+
+# ----------------------------------------------- interrupted-V7 recovery --
+
+
+async def _build_v6_database(path, reservation_expires="2099-01-01T00:00:00+00:00"):
+    """Create a v6 ledger with one dataset and one granted reservation."""
+    conn = await aiosqlite.connect(path)
+    try:
+        for schema in (
+            db.SCHEMA_V1, db.SCHEMA_V2, db.SCHEMA_V3, db.SCHEMA_V4,
+            db.SCHEMA_V5, db.SCHEMA_V6,
+        ):
+            await conn.executescript(schema)
+        await conn.execute(
+            "INSERT INTO datasets "
+            "(dataset_id, epsilon_cap, delta_cap, description, created_at) "
+            "VALUES ('legacy', 1.0, 1e-6, 'old', '2026-01-01T00:00:00+00:00')"
+        )
+        await conn.execute(
+            "INSERT INTO reservations "
+            "(dataset_id, reservation_id, epsilon, delta, ttl_seconds, status, "
+            "reason, epsilon_before, epsilon_after, rdp_best_order, created_at, "
+            "expires_at) VALUES ('legacy', 'rv1', 0.1, 1e-7, 600, 'granted', "
+            "NULL, 0.0, 0.1, 1.1, '2026-01-01T00:00:01+00:00', ?)",
+            (reservation_expires,),
+        )
+        await conn.execute("PRAGMA user_version = 6")
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def _assert_recovered(path):
+    async with db.connect() as c:
+        async with c.execute("PRAGMA user_version") as cur:
+            assert (await cur.fetchone())[0] == db.LATEST_VERSION
+        async with c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='reservation_adjustments'"
+        ) as cur:
+            assert await cur.fetchone() is not None
+        row = await db.get_reservation(c, "legacy", "rv1")
+        assert row["status"] == "granted"
+        return row
+
+
+@pytest.mark.asyncio
+async def test_interrupted_v7_after_both_alters_is_repaired(
+    tmp_path, monkeypatch
+):
+    """Columns committed, backfill/table/version missing: repair completes it."""
+    old_db_path = str(tmp_path / "half.db")
+    await _build_v6_database(old_db_path)
+
+    # Simulate the old release crash: executescript auto-committed the two
+    # ALTER statements but the process died before the backfill / table and
+    # the separate user_version advance.
+    conn = await aiosqlite.connect(old_db_path)
+    try:
+        await conn.executescript(
+            "ALTER TABLE reservations ADD COLUMN original_epsilon REAL;\n"
+            "ALTER TABLE reservations ADD COLUMN original_delta REAL;"
+        )
+    finally:
+        await conn.close()
+
+    monkeypatch.setattr(
+        db, "settings", dataclasses.replace(settings, db_path=old_db_path)
+    )
+    await db.init_db()
+    # A second startup (restart) must also succeed and leave everything intact.
+    await db.init_db()
+
+    row = await _assert_recovered(old_db_path)
+    assert row["epsilon"] == pytest.approx(0.1)
+    assert row["delta"] == pytest.approx(1e-7)
+    assert row["original_epsilon"] == pytest.approx(0.1)
+    assert row["original_delta"] == pytest.approx(1e-7)
+
+    # The API serves the recovered ledger end to end: an adjustment against
+    # the rescued reservation is admitted.
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        response = await ac.post(
+            "/datasets/legacy/reservations/rv1/adjustments",
+            json=_adj("adj-recovered", epsilon=0.2, delta=1e-7),
+        )
+        assert response.status_code == 201
+        assert response.json()["allowed"] is True
+
+
+@pytest.mark.asyncio
+async def test_interrupted_v7_after_first_alter_is_repaired(
+    tmp_path, monkeypatch
+):
+    """Only original_epsilon exists: the missing column is added on repair."""
+    old_db_path = str(tmp_path / "half.db")
+    await _build_v6_database(old_db_path)
+
+    conn = await aiosqlite.connect(old_db_path)
+    try:
+        await conn.execute(
+            "ALTER TABLE reservations ADD COLUMN original_epsilon REAL"
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    monkeypatch.setattr(
+        db, "settings", dataclasses.replace(settings, db_path=old_db_path)
+    )
+    await db.init_db()
+    await db.init_db()  # restart is a no-op and must not raise
+
+    row = await _assert_recovered(old_db_path)
+    assert row["original_epsilon"] == pytest.approx(0.1)
+    assert row["original_delta"] == pytest.approx(1e-7)
+
+
+@pytest.mark.asyncio
+async def test_interrupted_v7_preserves_existing_frozen_quota(
+    tmp_path, monkeypatch
+):
+    """A frozen original quota left by the half-migration is never overwritten."""
+    old_db_path = str(tmp_path / "half.db")
+    await _build_v6_database(old_db_path)
+
+    # Columns + backfill committed, adjustments table never created.
+    conn = await aiosqlite.connect(old_db_path)
+    try:
+        await conn.executescript(
+            "ALTER TABLE reservations ADD COLUMN original_epsilon REAL;\n"
+            "ALTER TABLE reservations ADD COLUMN original_delta REAL;\n"
+            "UPDATE reservations SET original_epsilon = epsilon, "
+            "original_delta = delta WHERE original_epsilon IS NULL;\n"
+            "UPDATE reservations SET epsilon = 0.3, delta = 1e-9 "
+            "WHERE dataset_id = 'legacy' AND reservation_id = 'rv1';"
+        )
+    finally:
+        await conn.close()
+
+    monkeypatch.setattr(
+        db, "settings", dataclasses.replace(settings, db_path=old_db_path)
+    )
+    await db.init_db()
+
+    row = await _assert_recovered(old_db_path)
+    # Live quota is the post-adjustment value ...
+    assert row["epsilon"] == pytest.approx(0.3)
+    assert row["delta"] == pytest.approx(1e-9)
+    # ... while the frozen creation payload survives untouched.
+    assert row["original_epsilon"] == pytest.approx(0.1)
+    assert row["original_delta"] == pytest.approx(1e-7)
+
+
+@pytest.mark.asyncio
+async def test_failed_migration_step_rolls_back(tmp_path, monkeypatch):
+    """A failure inside a migration step leaves the whole step uncommitted."""
+    old_db_path = str(tmp_path / "rolledback.db")
+    await _build_v6_database(old_db_path)
+    monkeypatch.setattr(
+        db, "settings", dataclasses.replace(settings, db_path=old_db_path)
+    )
+
+    real_v7 = db.MIGRATIONS[7]
+    broken_v7 = (
+        "ALTER TABLE reservations ADD COLUMN original_epsilon REAL;\n"
+        "ALTER TABLE no_such_table ADD COLUMN nope REAL;"
+    )
+    monkeypatch.setitem(db.MIGRATIONS, 7, broken_v7)
+
+    with pytest.raises(aiosqlite.Error):
+        await db.init_db()
+
+    async with db.connect() as c:
+        async with c.execute("PRAGMA user_version") as cur:
+            assert (await cur.fetchone())[0] == 6
+        # The first ALTER committed by the broken step must have rolled back,
+        # so retrying the real step after the fix hits no duplicate column.
+        columns = await db._table_columns(c, "reservations")
+        assert "original_epsilon" not in columns
+
+    monkeypatch.setitem(db.MIGRATIONS, 7, real_v7)
+    await db.init_db()
+    await _assert_recovered(old_db_path)

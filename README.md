@@ -163,6 +163,12 @@ LEDGER_PORT=18000 docker compose up -d --build
 数据库文件持久化在命名卷 `dp-ledger-data` 内（容器内 `/data/ledger.db`，
 SQLite WAL 模式）。
 
+**升级与中断恢复**：每次启动都在容器内自动完成 schema 迁移——结构变更、
+旧数据回填与版本号推进在同一个 SQLite 事务内原子提交；即使上次容器在
+迁移进行中被杀掉（包括 V7 旧实现遗留的「半迁移」库），重启也会自动补齐
+或整体重试，现有预留与额度原样保留，之后 API 正常服务、`/health` 返回
+200。细节见[第 7 节「数据库迁移」](#7-数据库迁移)。
+
 ---
 
 ## 2. 本地（无 Docker）运行
@@ -1514,7 +1520,25 @@ EPSILON_TOLERANCE` 的子集为可行。在全部可行子集中按以下顺序�
 ## 7. 数据库迁移
 
 Schema 由 SQLite 的 `PRAGMA user_version` 管理，服务启动时自动顺序执行
-待应用的迁移脚本（幂等 DDL，包在一个事务里），**无需人工干预**：
+待应用的迁移，**无需人工干预**。每个版本是**一步原子迁移**：该步的全部
+结构变更（`CREATE` / `ALTER`）、旧数据回填与 `PRAGMA user_version` 版本号
+推进放在**同一个 `BEGIN IMMEDIATE` 写事务**里提交——要么整步生效，要么
+（进程被杀、掉电、单条语句失败时）整体回滚到升级前的版本号与结构。因此
+迁移进行中进程中断后再次启动时，会从**上一个版本号**整体重试该步，绝不
+会重复执行已提交的 `ALTER TABLE` 而报 `duplicate column name`，API 可
+正常启动。
+
+**V7 半迁移自动补齐（升级中断恢复）**：更早的版本中，V7 迁移先用
+`executescript` 逐条自动提交了 `ALTER TABLE … ADD COLUMN
+original_epsilon / original_delta`，版本号却在脚本之外单独推进；若进程
+恰在两者之间中断，重启时会残留一个「`user_version` 仍为 6、但
+`reservations` 已带 V7 列」的半迁移库，旧逻辑重复 ALTER 导致服务无法
+启动。启动迁移现在会识别这种遗留状态并**自动补齐**：缺列则补列，旧预留
+的 `original_epsilon` / `original_delta` 仅在仍为 `NULL` 时按创建额度
+回填，再以 `IF NOT EXISTS` 建好 `reservation_adjustments` 表与索引，最后
+在**同一事务**内把版本号推进到 7。恢复全程**保留现有预留及其已冻结的原
+额度**（回填不会覆盖已经写入的原值），补齐后**重复启动**只是无操作、
+服务可稳定对外提供 API；无需手工删库或改 `user_version`。
 
 | 版本 | 内容 |
 | --- | --- |
@@ -1527,7 +1551,10 @@ Schema 由 SQLite 的 `PRAGMA user_version` 管理，服务启动时自动顺序
 | 7 | `reservations` 表新增 `original_epsilon` / `original_delta`（冻结创建时负载，旧行以当前额度回填），并新增 `reservation_adjustments` 表（`(dataset_id, adjustment_id)` 唯一、目标预留、调整前后额度、请求额度、裁定状态、调整前后组合 epsilon 快照与时间戳）。调整成功只改写预留行的实时额度列；已有申请、预留与续期记录原样保留 |
 
 旧版本数据库（无 `user_version`，即 v0）启动时会先确保 v1 表存在再顺序升级
-到最新版本，已有数据集、申请与预留记录原样保留。
+到最新版本，已有数据集、申请与预留记录原样保留。**升级在容器启动阶段自动
+完成**：`docker compose up -d`（或容器因 `restart: unless-stopped` 自动
+重启）后，任何未完成的迁移都会被原子重试或补齐，随后 API 即开始服务；
+`/health` 返回 200 表示迁移与启动均已完成。
 
 ---
 

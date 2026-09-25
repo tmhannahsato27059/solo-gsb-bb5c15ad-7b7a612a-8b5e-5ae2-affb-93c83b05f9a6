@@ -14,9 +14,18 @@ Concurrency model
 Schema migrations
 -----------------
 A ``PRAGMA user_version`` integer selects the next migration to apply.
-Each migration is an idempotent DDL script wrapped in one transaction, so
-both fresh databases and old ledgers created before reservations existed
-arrive at the latest schema on startup.
+Each migration step -- its structural DDL, any data back-fill and the
+``PRAGMA user_version`` advance -- runs inside one explicit
+``BEGIN IMMEDIATE`` transaction, so a crash or kill mid-step rolls the
+whole step back: on restart the same step is retried against the old
+version and never replays an already-committed ``ALTER TABLE``.  The one
+historical exception is version 7 as shipped before this fix, whose
+``ALTER TABLE`` statements were auto-committed separately from the
+version bump; a startup that recognises that orphaned half-migration
+(user_version still 6 while ``reservations`` already carries the V7
+columns) finishes the missing back-fill / table creation and advances
+the version in a single transaction, preserving every existing
+reservation and its original quota.
 """
 from __future__ import annotations
 
@@ -238,9 +247,20 @@ CREATE INDEX IF NOT EXISTS idx_renewals_dataset
 # the adjusted quota.  Rejected attempts (projected epsilon over the cap) are
 # stored too, with *_after == *_before: the live quota is demonstrably
 # untouched while the first verdict and its quota snapshots survive.
-SCHEMA_V7 = """
+
+# V7a: the two frozen-creation-payload columns added to ``reservations``.  They
+# are kept as their own script fragment because the interrupted-V7 recovery
+# path must be able to (re)apply exactly this ALTER step while skipping an
+# ALTER that an older release already committed before crashing.
+SCHEMA_V7_ALTER = """
 ALTER TABLE reservations ADD COLUMN original_epsilon REAL;
 ALTER TABLE reservations ADD COLUMN original_delta REAL;
+"""
+
+# V7b: idempotent back-fill of the old reserved rows plus the new audit table.
+# Both pieces are safe to re-run: the UPDATE only touches rows whose frozen
+# payload is still missing, and CREATE TABLE / INDEX use IF NOT EXISTS.
+SCHEMA_V7_DATA_AND_TABLE = """
 UPDATE reservations
    SET original_epsilon = epsilon,
        original_delta = delta
@@ -274,6 +294,9 @@ CREATE TABLE IF NOT EXISTS reservation_adjustments (
 CREATE INDEX IF NOT EXISTS idx_adjustments_dataset
     ON reservation_adjustments (dataset_id, id);
 """
+
+# Full version-7 script as applied on a clean v6 -> v7 upgrade.
+SCHEMA_V7 = SCHEMA_V7_ALTER + SCHEMA_V7_DATA_AND_TABLE
 
 MIGRATIONS: dict[int, str] = {
     1: SCHEMA_V1,
@@ -385,18 +408,134 @@ async def init_db() -> None:
         await _migrate(db)
 
 
-async def _migrate(db: aiosqlite.Connection) -> None:
+def _split_statements(script: str) -> list[str]:
+    """Split a migration script into individual SQL statements.
+
+    Statements are separated by top-level semicolons only: semicolons
+    inside quoted strings or ``--`` / ``/* */`` comments never split.
+    (The bundled migration scripts contain no semicolons inside string
+    literals; the splitter is defensive, not load-bearing.)
+    """
+    statements: list[str] = []
+    current: list[str] = []
+    i = 0
+    n = len(script)
+    quote: Optional[str] = None
+    while i < n:
+        ch = script[i]
+        if quote is not None:
+            current.append(ch)
+            if ch == quote:
+                # A doubled quote is an escaped quote, not the terminator.
+                if i + 1 < n and script[i + 1] == quote:
+                    current.append(script[i + 1])
+                    i += 1
+                else:
+                    quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+            current.append(ch)
+        elif ch == "-" and script[i + 1 : i + 2] == "-":
+            end = script.find("\n", i)
+            i = n if end == -1 else end
+            continue
+        elif ch == "/" and script[i + 1 : i + 2] == "*":
+            end = script.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        elif ch == ";":
+            statement = "".join(current).strip()
+            if statement:
+                statements.append(statement)
+            current = []
+        else:
+            current.append(ch)
+        i += 1
+    statement = "".join(current).strip()
+    if statement:
+        statements.append(statement)
+    return statements
+
+
+async def _user_version(db: aiosqlite.Connection) -> int:
     async with db.execute("PRAGMA user_version") as cur:
         row = await cur.fetchone()
-    version = int(row[0])
+    return int(row[0])
+
+
+async def _table_columns(db: aiosqlite.Connection, table: str) -> set[str]:
+    """Column names of ``table``; empty when the table does not exist."""
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        rows = await cur.fetchall()
+    return {str(row[1]) for row in rows}
+
+
+async def _apply_migration(
+    db: aiosqlite.Connection, version: int, statements: list[str]
+) -> None:
+    """Apply one schema step and the version advance atomically.
+
+    Every statement of the step -- DDL, data back-fill and the
+    ``PRAGMA user_version`` bump -- commits or rolls back together, so a
+    process killed mid-step leaves the database exactly at the previous
+    ``user_version`` and the next startup simply retries the step.
+    """
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in statements:
+            await db.execute(statement)
+        # PRAGMA user_version accepts only an integer literal, and version
+        # is an internal constant, never user input.
+        await db.execute(f"PRAGMA user_version = {version}")
+        await db.commit()
+    except BaseException:
+        await db.rollback()
+        raise
+
+
+async def _recover_interrupted_v7(db: aiosqlite.Connection, version: int) -> int:
+    """Finish a version-7 migration interrupted by a pre-fix release.
+
+    Older code ran the V7 script via ``executescript`` (auto-committing
+    each statement) and advanced ``user_version`` only afterwards, so a
+    crash between the two left a database whose ``reservations`` table
+    already carries ``original_epsilon`` (and usually ``original_delta``)
+    while ``user_version`` is still 6.  Re-running the V7 script on such a
+    database fails with ``duplicate column name`` and the API never
+    starts.  Detect that orphaned half-migration and finish it -- add the
+    missing column if any, back-fill the frozen creation payload of old
+    rows, create the adjustments table -- together with the version
+    advance in one atomic transaction.  Existing reservations and their
+    already-recorded original quotas are preserved: the back-fill only
+    touches rows whose frozen payload is still NULL.
+    """
+    if version != 6:
+        return version
+    columns = await _table_columns(db, "reservations")
+    if "original_epsilon" not in columns:
+        # No trace of V7: a clean v6 database takes the normal path.
+        return version
+    statements: list[str] = []
+    if "original_delta" not in columns:
+        statements.append(
+            "ALTER TABLE reservations ADD COLUMN original_delta REAL"
+        )
+    statements.extend(_split_statements(SCHEMA_V7_DATA_AND_TABLE))
+    await _apply_migration(db, 7, statements)
+    return 7
+
+
+async def _migrate(db: aiosqlite.Connection) -> None:
+    version = await _user_version(db)
+    # Repair databases left half-migrated by the pre-atomic V7 migration
+    # before applying any further step.
+    version = await _recover_interrupted_v7(db, version)
     while version < LATEST_VERSION:
         next_version = version + 1
-        await db.executescript(MIGRATIONS[next_version])
-        # PRAGMA user_version accepts only an integer literal, and next_version
-        # is an internal constant, never user input.
-        await db.execute(f"PRAGMA user_version = {next_version}")
+        await _apply_migration(
+            db, next_version, _split_statements(MIGRATIONS[next_version])
+        )
         version = next_version
-    await db.commit()
 
 
 @asynccontextmanager
